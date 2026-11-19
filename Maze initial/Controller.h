@@ -241,26 +241,23 @@ class Controller_c {
     int32_t stall_left_start = 0, stall_right_start = 0;
 
     // ---- maze state ----
-    enum MazePhase { MAZE_DRIVING, MAZE_APPROACH, MAZE_TURNING, MAZE_POST_TURN };
-    MazePhase maze_phase = MAZE_DRIVING;
     bool maze_started = false;
     bool maze_finished = false;
-    bool surface_action_done = false;
-    bool maze_turn_seen_running = false;
-    unsigned long maze_phase_start_ms = 0;
-    float maze_turn_angle_rad = 0.0f;
-    unsigned long maze_approach_ms = 0;
-    unsigned long maze_post_turn_ms = 0;
 
-    // Require several consecutive readings before accepting a surface change.
+    bool surface_action_done = false;
+    bool surface_entry_pending = false;       // waiting to finish moving onto a new surface
+    unsigned long surface_entry_start_ms = 0; // when the surface change was confirmed
+
+    // Turn state
+    bool maze_turn_started = false;
+    bool maze_turn_seen_running = false;
+    unsigned long maze_turn_start_ms = 0;
+
+    // Detect when the robot moves onto a different surface
     Surface candidate_surface = SURF_UNKNOWN;
     unsigned int candidate_surface_count = 0;
 
     static const unsigned int SURFACE_CHANGE_SAMPLES = 5;
-    static const unsigned long TINFOIL_APPROACH_MS = 2000;
-    static const unsigned long CARPET_APPROACH_MS = 2000;
-    static const unsigned long TINFOIL_POST_TURN_MS = 500;
-    static const unsigned long CARPET_POST_TURN_MS = 500;
 
     static const unsigned int REST_SAMPLES = 50;       // ~0.5 s with motors off
     static constexpr float IR_TINFOIL_MAX   = 495.0f;  // below = tinfoil
