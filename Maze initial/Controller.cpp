@@ -18,11 +18,6 @@ const unsigned long Controller_c::ENCODER_TEST_TIMEOUT_MS;
 constexpr float Controller_c::ENCODER_TEST_LEFT_PWM;
 constexpr float Controller_c::ENCODER_TEST_RIGHT_PWM;
 const unsigned int Controller_c::REST_SAMPLES;
-const unsigned int Controller_c::SURFACE_CHANGE_SAMPLES;
-const unsigned long Controller_c::TINFOIL_APPROACH_MS;
-const unsigned long Controller_c::CARPET_APPROACH_MS;
-const unsigned long Controller_c::TINFOIL_POST_TURN_MS;
-const unsigned long Controller_c::CARPET_POST_TURN_MS;
 constexpr float Controller_c::IR_TINFOIL_MAX;
 constexpr float Controller_c::IR_CARPET_MAX;
 constexpr float Controller_c::IR_CARDBOARD_MAX;
@@ -30,6 +25,9 @@ const unsigned long Controller_c::STALL_WINDOW_MS;
 const int32_t Controller_c::STALL_TICKS;
 constexpr float Controller_c::KICK_STEP;
 constexpr float Controller_c::MAX_KICK;
+
+// Keep driving onto a newly detected surface before stopping to classify it.
+static const unsigned long SURFACE_ENTRY_DELAY_MS = 500;
 
 // Scripted sequence for the combined (red) test.
 static const unsigned long COMBINED_STILL_START_MS = 1500;    // stationary at the start
@@ -81,16 +79,17 @@ void Controller_c::reset() {
   pwm_kick = 0;
   stall_window_ms = 0;
 
-  // Maze state: start from the beginning whenever the routine is reset.
-  maze_phase = MAZE_DRIVING;
+  // Maze state
   maze_started = false;
   maze_finished = false;
   surface_action_done = false;
+  surface_entry_pending = false;
+  surface_entry_start_ms = 0;
+
+  maze_turn_started = false;
   maze_turn_seen_running = false;
-  maze_phase_start_ms = 0;
-  maze_turn_angle_rad = 0.0f;
-  maze_approach_ms = 0;
-  maze_post_turn_ms = 0;
+  maze_turn_start_ms = 0;
+
   candidate_surface = SURF_UNKNOWN;
   candidate_surface_count = 0;
 
@@ -717,136 +716,34 @@ void Controller_c::testOffset(Robot_c &robot, unsigned long now) {
 
 void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
 
-  // Once the second table has been reached, keep the robot stopped.
+  // 1) If the maze has finished, keep the motors stopped.
   if (maze_finished) {
     robot.setMotorPWM(0, 0);
     return;
   }
 
-  // Average the five IR sensors into one surface reading.
+  // Calculate the average of the five IR sensors.
   float ir = ((float)robot.surface.reading[0] +
               (float)robot.surface.reading[1] +
               (float)robot.surface.reading[2] +
               (float)robot.surface.reading[3] +
               (float)robot.surface.reading[4]) / 5.0f;
 
-  // Convert a live reading into the same categories used by the stationary
-  // classification below. This is used only to detect a change of surface.
-  Surface reading_surface;
-  if (ir < IR_TINFOIL_MAX) {
-    reading_surface = SURF_TINFOIL;
-  } else if (ir < IR_CARPET_MAX) {
-    reading_surface = SURF_CARPET;
-  } else if (ir < IR_CARDBOARD_MAX) {
-    reading_surface = SURF_CARDBOARD;
-  } else {
-    reading_surface = SURF_TABLE;
-  }
 
-  // Retain the existing speed scaling for each surface.
-  float scale = 1.0f;
-  if (surface == SURF_CARPET) {
-    scale = 1.4f;
-  } else if (surface == SURF_TINFOIL) {
-    scale = 0.95f;
-  }
-
-  // Keep the existing encoder-based stall compensation while driving or
-  // approaching a turn. Do not adjust it while the turn helper is in control.
-  if (surface != SURF_UNKNOWN && maze_phase != MAZE_TURNING &&
-      now - stall_window_ms >= STALL_WINDOW_MS) {
-    int32_t left_count = robot.getLeftEncoderCount();
-    int32_t right_count = robot.getRightEncoderCount();
-    int32_t ticks = abs(left_count - stall_left_start) + abs(right_count - stall_right_start);
-
-    if (ticks < STALL_TICKS) {
-      pwm_kick += KICK_STEP;
-      if (pwm_kick > MAX_KICK) pwm_kick = MAX_KICK;
-    } else {
-      pwm_kick -= KICK_STEP;
-      if (pwm_kick < 0.0f) pwm_kick = 0.0f;
-    }
-
-    stall_window_ms = now;
-    stall_left_start = left_count;
-    stall_right_start = right_count;
-  }
-
-  float pwm = BASE_PWM * scale + pwm_kick;
-
-  // Poll a commanded turn until the motion helper has run and then stopped.
-  if (maze_phase == MAZE_TURNING) {
-    bool turn_finished = false;
-    bool turn_failed = false;
-
-    if (robot.getMotionStatus()) {
-      if (robot.isMotionHelperRunning()) {
-        maze_turn_seen_running = true;
-      } else if (maze_turn_seen_running) {
-        turn_finished = true;
-      }
-    } else {
-      report("# getMotionStatus failed during maze turn\n");
-      turn_failed = true;
-    }
-
-    if (!turn_finished && !turn_failed && now - maze_phase_start_ms > move_timeout_ms) {
-      report("# maze turn timed out\n");
-      turn_failed = true;
-    }
-
-    if (turn_finished) {
-      robot.setMotorPWM(0, 0);
-      maze_phase = MAZE_POST_TURN;
-      maze_phase_start_ms = now;
-      maze_turn_seen_running = false;
-    } else if (turn_failed) {
-      robot.setMotorPWM(0, 0);
-      maze_finished = true; // fail safe: do not continue blindly after a failed turn
-    }
-    return;
-  }
-
-  // After either turning surface, drive straight for its configured time
-  // before resuming surface-change detection.
-  if (maze_phase == MAZE_POST_TURN) {
-    robot.setMotorPWM(pwm, pwm);
-    if (now - maze_phase_start_ms >= maze_post_turn_ms) {
-      maze_phase = MAZE_DRIVING;
-      maze_phase_start_ms = now;
-    }
-    return;
-  }
-
-  // Both tinfoil and carpet use the same approach-and-turn sequence. The
-  // approach timer starts only after the surface has been classified.
-  if (maze_phase == MAZE_APPROACH) {
-    robot.setMotorPWM(pwm, pwm);
-    if (now - maze_phase_start_ms >= maze_approach_ms) {
-      // Stop the straight-driving command before handing control to the
-      // asynchronous rotation helper.
-      robot.setMotorPWM(0, 0);
-      if (robot.startRotateAngle(maze_turn_angle_rad)) {
-        maze_phase = MAZE_TURNING;
-        maze_phase_start_ms = now;
-        maze_turn_seen_running = false;
-        report("# approach complete: starting %.2f rad turn\n", maze_turn_angle_rad);
-      } else {
-        report("# failed to start maze turn\n");
-        maze_finished = true;
-      }
-    }
-    return;
-  }
-
-  // MEASURE: stop and average the sensors while the surface is unknown.
+  // 2) MEASURE: classify a new surface while stationary.
   if (surface == SURF_UNKNOWN) {
+
     robot.setMotorPWM(0, 0);
+
     rest_ir_sum += ir;
     rest_ir_count++;
-    if (rest_ir_count < REST_SAMPLES) return;
+
+    if (rest_ir_count < REST_SAMPLES) {
+      return;
+    }
 
     float level = rest_ir_sum / (float)rest_ir_count;
+
     if (level < IR_TINFOIL_MAX) {
       surface = SURF_TINFOIL;
     } else if (level < IR_CARPET_MAX) {
@@ -857,13 +754,7 @@ void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
       surface = SURF_TABLE;
     }
 
-    rest_ir_sum = 0;
-    rest_ir_count = 0;
-    surface_action_done = false;
-    candidate_surface = SURF_UNKNOWN;
-    candidate_surface_count = 0;
-
-    // Show the detected surface's LED colour.
+    // Show the surface's LED colour.
     if (surface == SURF_TABLE) {
       robot.setLED(0, 0, 255, MENU_LED_BRIGHTNESS);
     } else if (surface == SURF_CARDBOARD) {
@@ -874,86 +765,238 @@ void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
       robot.setLED(0, 255, 0, MENU_LED_BRIGHTNESS);
     }
 
-    report("# surface = %d (0 unknown, 1 table, 2 cardboard, 3 carpet, 4 tinfoil), mean IR = %.0f\n",
-           (int)surface, level);
+    report("# surface = %d, mean IR = %.0f\n", (int)surface, level);
+
+    // Prepare for the next movement.
+    surface_action_done = false;
+    candidate_surface_count = 0;
 
     stall_window_ms = now;
     stall_left_start = robot.getLeftEncoderCount();
     stall_right_start = robot.getRightEncoderCount();
+
     return;
   }
 
-  // Table is both the start marker and the finish marker.
-  if (surface == SURF_TABLE && !surface_action_done) {
-    if (!maze_started) {
-      maze_started = true;
-      surface_action_done = true;
-      report("# start table detected: maze started\n");
+
+  // 3) HANDLE AN ACTIVE TURN.
+  // Keep checking until the rotation helper finishes.
+  if (maze_turn_started) {
+
+    bool stop_now = false;
+
+    if (robot.getMotionStatus()) {
+
+      if (robot.isMotionHelperRunning()) {
+        maze_turn_seen_running = true;
+
+      } else if (maze_turn_seen_running) {
+        stop_now = true;
+      }
+
     } else {
-      robot.setMotorPWM(0, 0);
+      report("# turn status failed\n");
+      stop_now = true;
       maze_finished = true;
-      report("# finish table detected: maze stopped\n");
-      return;
     }
+
+    // Safety timeout.
+    if (!stop_now && now - maze_turn_start_ms > move_timeout_ms) {
+      report("# turn timed out\n");
+      stop_now = true;
+      maze_finished = true;
+    }
+
+    if (stop_now) {
+      robot.setMotorPWM(0, 0);
+      maze_turn_started = false;
+      maze_turn_seen_running = false;
+    }
+
+    return;
   }
 
-  // Set up the same timed approach for each surface that requires a turn.
-  // Cardboard and the starting table simply continue straight.
-  if (!surface_action_done) {
-    if (surface == SURF_TINFOIL) {
-      maze_turn_angle_rad = -PI / 2.0f; // right turn
-      maze_approach_ms = TINFOIL_APPROACH_MS;
-      maze_post_turn_ms = TINFOIL_POST_TURN_MS;
-      maze_phase = MAZE_APPROACH;
-      maze_phase_start_ms = now;
-      surface_action_done = true;
-      report("# tinfoil detected: approaching before right turn\n");
-      robot.setMotorPWM(pwm, pwm);
-      return;
-    } else if (surface == SURF_CARPET) {
-      maze_turn_angle_rad = PI / 2.0f; // left turn
-      maze_approach_ms = CARPET_APPROACH_MS;
-      maze_post_turn_ms = CARPET_POST_TURN_MS;
-      maze_phase = MAZE_APPROACH;
-      maze_phase_start_ms = now;
-      surface_action_done = true;
-      report("# carpet detected: approaching before left turn\n");
-      robot.setMotorPWM(pwm, pwm);
-      return;
+
+  // 4) CALCULATE FORWARD PWM.
+  float scale = 1.0f;
+
+  if (surface == SURF_CARPET) {
+    scale = 1.4f;
+  } else if (surface == SURF_TINFOIL) {
+    scale = 0.95f;
+  }
+
+
+  // Stuck detection and PWM adjustment.
+  if (now - stall_window_ms >= STALL_WINDOW_MS) {
+
+    int32_t left_count = robot.getLeftEncoderCount();
+    int32_t right_count = robot.getRightEncoderCount();
+
+    int32_t ticks = abs(left_count - stall_left_start)
+                  + abs(right_count - stall_right_start);
+
+    if (ticks < STALL_TICKS) {
+      pwm_kick = pwm_kick + KICK_STEP;
+
+      if (pwm_kick > MAX_KICK) {
+        pwm_kick = MAX_KICK;
+      }
+
     } else {
-      // Cardboard (and the starting table) means continue straight.
+      pwm_kick = pwm_kick - KICK_STEP;
+
+      if (pwm_kick < 0.0f) {
+        pwm_kick = 0.0f;
+      }
+    }
+
+    stall_window_ms = now;
+    stall_left_start = left_count;
+    stall_right_start = right_count;
+  }
+
+  float pwm = BASE_PWM * scale + pwm_kick;
+
+  // If a new surface has been detected, keep moving straight for 500 ms
+  // before stopping. This lets the robot get fully onto that surface.
+  if (surface_entry_pending) {
+    if (now - surface_entry_start_ms >= SURFACE_ENTRY_DELAY_MS) {
+      robot.setMotorPWM(0, 0);
+      surface_entry_pending = false;
+
+      // Now measure the new surface while stationary, as before.
+      surface = SURF_UNKNOWN;
+      rest_ir_sum = 0;
+      rest_ir_count = 0;
+      candidate_surface = SURF_UNKNOWN;
+      candidate_surface_count = 0;
+      pwm_kick = 0;
+    } else {
+      robot.setMotorPWM(pwm, pwm);
+    }
+    return;
+  }
+
+  // 5) PER-SURFACE ACTIONS.
+  // Each surface only triggers its action once.
+
+  if (!surface_action_done) {
+
+    if (surface == SURF_TABLE) {
+
+      if (!maze_started) {
+
+        // First table: start the maze.
+        maze_started = true;
+        surface_action_done = true;
+
+        report("# maze started\n");
+
+      } else {
+
+        // Second table: finish the maze.
+        robot.setMotorPWM(0, 0);
+        maze_finished = true;
+
+        report("# maze finished\n");
+        return;
+      }
+
+    } else if (surface == SURF_TINFOIL) {
+
+      // Tinfoil: turn right 90 degrees.
+      if (robot.startRotateAngle(-PI / 2.0f)) {
+
+        maze_turn_started = true;
+        maze_turn_seen_running = false;
+        maze_turn_start_ms = now;
+        surface_action_done = true;
+
+        report("# turning right\n");
+
+      } else {
+        report("# right turn failed\n");
+        robot.setMotorPWM(0, 0);
+        maze_finished = true;
+      }
+
+      return;
+
+    } else if (surface == SURF_CARPET) {
+
+      // Carpet: turn left 90 degrees.
+      if (robot.startRotateAngle(PI / 2.0f)) {
+
+        maze_turn_started = true;
+        maze_turn_seen_running = false;
+        maze_turn_start_ms = now;
+        surface_action_done = true;
+
+        report("# turning left\n");
+
+      } else {
+        report("# left turn failed\n");
+        robot.setMotorPWM(0, 0);
+        maze_finished = true;
+      }
+
+      return;
+
+    } else if (surface == SURF_CARDBOARD) {
+
+      // Cardboard: continue straight.
       surface_action_done = true;
+      report("# going straight\n");
     }
   }
 
-  // Detect a transition while driving. Require several consecutive readings
-  // so one noisy sample cannot trigger a stop and reclassification.
-  if (reading_surface != surface) {
-    if (candidate_surface == reading_surface) {
+
+  // 6) CHECK WHETHER THE ROBOT HAS ENTERED A DIFFERENT SURFACE.
+  // Classify the live sensor reading to see whether it differs
+  // from the surface currently being traversed.
+
+  Surface observed_surface;
+
+  if (ir < IR_TINFOIL_MAX) {
+    observed_surface = SURF_TINFOIL;
+  } else if (ir < IR_CARPET_MAX) {
+    observed_surface = SURF_CARPET;
+  } else if (ir < IR_CARDBOARD_MAX) {
+    observed_surface = SURF_CARDBOARD;
+  } else {
+    observed_surface = SURF_TABLE;
+  }
+
+  if (observed_surface != surface) {
+
+    if (observed_surface == candidate_surface) {
       candidate_surface_count++;
     } else {
-      candidate_surface = reading_surface;
+      candidate_surface = observed_surface;
       candidate_surface_count = 1;
     }
 
+    // Require several consecutive readings before accepting a change.
     if (candidate_surface_count >= SURFACE_CHANGE_SAMPLES) {
-      // A stable new surface has been detected while moving. Accept it
-      // directly instead of stopping for another 50-sample measurement.
-      // This is important for the approach distance: the robot must keep
-      // rolling over tinfoil/carpet before it performs the turn.
-      surface = reading_surface;
-      surface_action_done = false;
+
+      // Confirm the change, but keep driving straight for 500 ms before
+      // stopping and classifying the new surface.
+      surface_entry_pending = true;
+      surface_entry_start_ms = now;
       candidate_surface = SURF_UNKNOWN;
       candidate_surface_count = 0;
-      report("# surface changed to %d while moving\n", (int)surface);
+
       return;
     }
+
   } else {
     candidate_surface = SURF_UNKNOWN;
     candidate_surface_count = 0;
   }
 
-  // Normal straight-ahead movement.
+
+  // 7) CONTINUE STRAIGHT.
   robot.setMotorPWM(pwm, pwm);
 }
 
