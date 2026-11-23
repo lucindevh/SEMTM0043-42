@@ -68,10 +68,6 @@ class Controller_c {
     static constexpr float ENCODER_TEST_RIGHT_PWM = 50.0f;
 
     // ---- Sensor test state (from the sensor code) ----
-    /** @brief Timestamp (us) of the last surface snapshot already logged by testOffset(). */
-    unsigned long last_surface_us;
-    /** @brief Sample counter for the sensor test. Cleared by reset(). */
-    unsigned long sample_num;
     /** @brief Trial counter shared by the sensor and odometry tests. NOT cleared by reset(). */
     unsigned long trial_num;
 
@@ -135,7 +131,6 @@ class Controller_c {
       ROUTINE_MOTOR_TEST,      // LED green (no longer in the menu)
       ROUTINE_ENCODER_TEST,    // LED red in the old menu (no longer in the menu)
       ROUTINE_ODOMETRY_TEST,   // LED blue (no longer in the menu)
-      ROUTINE_SENSOR_TEST,     // LED yellow (no longer in the menu)
       ROUTINE_COMBINED_TEST    // LED red: combined encoder/sensor/odometry/IMU test
     };
 
@@ -178,7 +173,6 @@ class Controller_c {
     };
 
     uint8_t signal;
-    Mode mode;
     TaskTimer_c update_timer;
     TaskTimer_c telemetry_timer;
     unsigned long recovery_start_ms;
@@ -230,6 +224,10 @@ class Controller_c {
     float pwm_kick = 0;
     unsigned long stall_window_ms = 0;
     int32_t stall_left_start = 0, stall_right_start = 0;
+    // ---- accelerometer roughness measurement ----
+    static const unsigned int ACCEL_WINDOW_SAMPLES = 50;
+    float accel_z_samples[ACCEL_WINDOW_SAMPLES] = {0};
+    unsigned int accel_z_count = 0;
 
     // ---- maze state ----
     enum MazePhase { MAZE_DRIVING, MAZE_TURNING, MAZE_POST_TURN };
@@ -296,12 +294,6 @@ class Controller_c {
 
     /** @brief Reports one CSV row for the rotation test over Serial and WiFi. */
     void reportOdometryRotation(Robot_c &robot, unsigned long timestamp_ms);
-
-    /** @brief Exercise 1: prints the five raw surface readings as one CSV line. */
-    void sensorTest(Robot_c &robot, unsigned long now);
-
-    /** @brief Exercise 2: prints one labelled CSV row per sensor for each new surface snapshot. */
-    void testOffset(Robot_c &robot, unsigned long now);
 
     /** @brief Measure the surface at rest, announce it with the LED, then drive with a surface-specific PWM. */
     void surfaceClassify(Robot_c &robot, unsigned long now);

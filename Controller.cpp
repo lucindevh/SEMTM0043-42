@@ -27,6 +27,7 @@ const unsigned long Controller_c::STALL_WINDOW_MS;
 const int32_t Controller_c::STALL_TICKS;
 constexpr float Controller_c::KICK_STEP;
 constexpr float Controller_c::MAX_KICK;
+const unsigned int Controller_c::ACCEL_WINDOW_SAMPLES;
 
 // Sequence for combined test
 static const unsigned long COMBINED_STILL_START_MS = 1500;        // 1.5s stationary at the start to configure gyro
@@ -53,7 +54,6 @@ Controller_c::Controller_c()
 
 void Controller_c::reset() {
   signal = 0;
-  mode = WAITING;
   recovery_start_ms = 0;
   call_count = 0;
   active_routine = ROUTINE_SURFACE_CLASSIFY;
@@ -67,8 +67,6 @@ void Controller_c::reset() {
   et_left_count2 = 0;
   et_right_count1 = 0;
   et_right_count2 = 0;
-  last_surface_us = 0;
-  sample_num = 0;
 
   // Surface classification: forget the last surface so the next run measures again.
   surface = SURF_UNKNOWN;
@@ -76,6 +74,10 @@ void Controller_c::reset() {
   rest_ir_count = 0;
   pwm_kick = 0;
   stall_window_ms = 0;
+  accel_z_count = 0;
+  for (unsigned int i = 0; i < ACCEL_WINDOW_SAMPLES; i++) {
+    accel_z_samples[i] = 0;
+  }
 
   // Maze state: start from the beginning whenever the routine is reset.
   maze_phase = MAZE_DRIVING;
@@ -111,7 +113,6 @@ void Controller_c::setSignal(uint8_t requested_signal) {
 
   if (signal == 0) {
     signal = 1;
-    mode = FOLLOWING_LINE;
     recovery_start_ms = 0;
   }
 }
@@ -138,7 +139,6 @@ void Controller_c::update(Robot_c &robot, RobotWifiAP_c &server, RobotIMU_c &imu
   // them so it cannot corrupt the CSV.
   bool csv_logging_running = (signal == 1 &&
                               (active_routine == ROUTINE_ODOMETRY_TEST ||
-                               active_routine == ROUTINE_SENSOR_TEST ||
                                active_routine == ROUTINE_COMBINED_TEST));
 
   // Ask the robot for latest information on surface reflectance sensors.
@@ -205,6 +205,50 @@ void Controller_c::update(Robot_c &robot, RobotWifiAP_c &server, RobotIMU_c &imu
     }
   }
 
+  // Surface roughness measurement: collect accelerometer samples only
+  // while the robot is driving forwards, not while stationary or turning.
+  if (signal == 1 &&
+      active_routine == ROUTINE_SURFACE_CLASSIFY &&
+      surface != SURF_UNKNOWN &&
+      maze_started &&
+      surface_action_done &&
+      maze_phase == MAZE_DRIVING &&
+      !maze_finished) {
+
+    if (imu.isSampleReady() && imu.read()) {
+      const auto s = imu.getSample();
+
+      accel_z_samples[accel_z_count] = (float)s.acceleration[2];
+      accel_z_count++;
+
+      // Calculate the standard deviation after 50 samples.
+      if (accel_z_count >= ACCEL_WINDOW_SAMPLES) {
+        float sum = 0.0f;
+        float sum_squares = 0.0f;
+
+        for (unsigned int i = 0; i < ACCEL_WINDOW_SAMPLES; i++) {
+          sum += accel_z_samples[i];
+          sum_squares += accel_z_samples[i] * accel_z_samples[i];
+        }
+
+        float mean = sum / ACCEL_WINDOW_SAMPLES;
+        float variance = (sum_squares / ACCEL_WINDOW_SAMPLES) - (mean * mean);
+
+        // Protect against tiny negative values caused by floating-point rounding.
+        if (variance < 0.0f) variance = 0.0f;
+
+        float accel_z_sd = sqrtf(variance);
+
+        report("# accel_z_sd = %.1f\\n", accel_z_sd);
+
+        accel_z_count = 0;
+      }
+    }
+  } else {
+    // Do not let samples from different movements or turns share a window.
+    accel_z_count = 0;
+  }
+
   // A routine has been started, so run the one that was selected.
   if (signal == 1) {
     if (active_routine == ROUTINE_MOTOR_TEST) {
@@ -213,17 +257,6 @@ void Controller_c::update(Robot_c &robot, RobotWifiAP_c &server, RobotIMU_c &imu
       encoderTest(robot, now);
     } else if (active_routine == ROUTINE_ODOMETRY_TEST) {
       odometryTest(robot, now);
-    } else if (active_routine == ROUTINE_SENSOR_TEST) {
-      // ---- Choose ONE sensor test function to run below ----
-      testOffset(robot, now);       // Exercise 2
-      // sensorTest(robot, now);    // Exercise 1
-
-      // The sensor test runs until the button is pressed again.
-      if (robot.isButtonPressed()) {
-        robot.setMotorPWM(0, 0);
-        menu_timer.resetTimer(now);
-        setSignal(0);               // soft reset: back to the menu
-      }
     } else if (active_routine == ROUTINE_COMBINED_TEST) {
       // ---- Scripted sequence. call_count is the phase: ----
       //   0 stationary at the start (also measures the gyro bias)
