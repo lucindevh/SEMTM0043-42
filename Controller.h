@@ -228,6 +228,11 @@ class Controller_c {
     static const unsigned int ACCEL_WINDOW_SAMPLES = 50;
     float accel_z_samples[ACCEL_WINDOW_SAMPLES] = {0};
     unsigned int accel_z_count = 0;
+    static constexpr float ACCEL_TABLE_CARDBOARD_THRESHOLD = 978.5f;
+    static constexpr float ACCEL_CARDBOARD_TINFOIL_THRESHOLD = 1362.0f;
+    static constexpr float ACCEL_TINFOIL_CARPET_THRESHOLD = 1783.5f;
+    float latest_accel_z_sd = 0.0f;
+    bool accel_sd_ready = false;
 
     // ---- maze state ----
     enum MazePhase { MAZE_DRIVING, MAZE_TURNING, MAZE_POST_TURN };
@@ -241,6 +246,9 @@ class Controller_c {
     // Require several consecutive readings before accepting a surface change.
     Surface candidate_surface = SURF_UNKNOWN;
     unsigned int candidate_surface_count = 0;
+
+    // True while collecting a fresh accelerometer window on a newly detected surface.
+    bool awaiting_transition_accel = false;
 
     static const unsigned int SURFACE_CHANGE_SAMPLES = 5;
     static const unsigned long POST_TURN_MS = 500;

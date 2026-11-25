@@ -79,6 +79,9 @@ void Controller_c::reset() {
     accel_z_samples[i] = 0;
   }
 
+  latest_accel_z_sd = 0.0f;
+  accel_sd_ready = false;
+
   // Maze state: start from the beginning whenever the routine is reset.
   maze_phase = MAZE_DRIVING;
   maze_started = false;
@@ -88,6 +91,7 @@ void Controller_c::reset() {
   maze_phase_start_ms = 0;
   candidate_surface = SURF_UNKNOWN;
   candidate_surface_count = 0;
+  awaiting_transition_accel = false;
 
   // Gyro bias: forget it, so the next routine run measures a fresh bias
   // (the bias changes between power-ups and with temperature).
@@ -238,6 +242,9 @@ void Controller_c::update(Robot_c &robot, RobotWifiAP_c &server, RobotIMU_c &imu
         if (variance < 0.0f) variance = 0.0f;
 
         float accel_z_sd = sqrtf(variance);
+
+        latest_accel_z_sd = accel_z_sd;
+        accel_sd_ready = true;
 
         report("# accel_z_sd = %.1f\\n", accel_z_sd);
 
@@ -754,21 +761,102 @@ void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
     if (rest_ir_count < REST_SAMPLES) return;
 
     float level = rest_ir_sum / (float)rest_ir_count;
+
+    // First classify using the average IR reading.
+    Surface ir_surface;
+
     if (level < IR_TINFOIL_MAX) {
-      surface = SURF_TINFOIL;
+      ir_surface = SURF_TINFOIL;
     } else if (level < IR_CARPET_MAX) {
-      surface = SURF_CARPET;
+      ir_surface = SURF_CARPET;
     } else if (level < IR_CARDBOARD_MAX) {
-      surface = SURF_CARDBOARD;
+      ir_surface = SURF_CARDBOARD;
     } else {
-      surface = SURF_TABLE;
+      ir_surface = SURF_TABLE;
     }
 
-    rest_ir_sum = 0;
-    rest_ir_count = 0;
-    surface_action_done = false;
-    candidate_surface = SURF_UNKNOWN;
-    candidate_surface_count = 0;
+    // Use the IR result alone only when no accelerometer measurement
+    // is available. This is expected for the initial starting table.
+    surface = ir_surface;
+
+    if (accel_sd_ready) {
+
+      // Classify the fresh accelerometer standard deviation.
+      Surface accel_surface;
+
+      if (latest_accel_z_sd < ACCEL_TABLE_CARDBOARD_THRESHOLD) {
+        accel_surface = SURF_TABLE;
+      } else if (latest_accel_z_sd < ACCEL_CARDBOARD_TINFOIL_THRESHOLD) {
+        accel_surface = SURF_CARDBOARD;
+      } else if (latest_accel_z_sd < ACCEL_TINFOIL_CARPET_THRESHOLD) {
+        accel_surface = SURF_TINFOIL;
+      } else {
+        accel_surface = SURF_CARPET;
+      }
+
+      // Convert both classifications to an ordered scale:
+      // table = 0, cardboard = 1, tinfoil = 2, carpet = 3.
+      int ir_rank;
+      int accel_rank;
+
+      switch (ir_surface) {
+        case SURF_TABLE:     ir_rank = 0; break;
+        case SURF_CARDBOARD: ir_rank = 1; break;
+        case SURF_TINFOIL:   ir_rank = 2; break;
+        case SURF_CARPET:    ir_rank = 3; break;
+        default:             ir_rank = 0; break;
+      }
+
+      switch (accel_surface) {
+        case SURF_TABLE:     accel_rank = 0; break;
+        case SURF_CARDBOARD: accel_rank = 1; break;
+        case SURF_TINFOIL:   accel_rank = 2; break;
+        case SURF_CARPET:    accel_rank = 3; break;
+        default:             accel_rank = 0; break;
+      }
+
+      // Combine the two sensor classifications equally.
+      // If their average falls halfway between two classes, round towards
+      // the accelerometer classification.
+      int rank_sum = ir_rank + accel_rank;
+      int fused_rank = rank_sum / 2;
+
+      if ((rank_sum % 2 != 0) && (accel_rank > ir_rank)) {
+        fused_rank++;
+      }
+
+      switch (fused_rank) {
+        case 0: surface = SURF_TABLE; break;
+        case 1: surface = SURF_CARDBOARD; break;
+        case 2: surface = SURF_TINFOIL; break;
+        case 3: surface = SURF_CARPET; break;
+        default: surface = ir_surface; break;
+      }
+
+      static const char *surface_names[] = {
+        "unknown", "table", "cardboard", "carpet", "tinfoil"
+      };
+
+      report("# surface = %s, IR = %s, accel = %s, IR mean = %.0f, accel SD = %.1f\n",
+            surface_names[(int)surface],
+            surface_names[(int)ir_surface],
+            surface_names[(int)accel_surface],
+            level,
+            latest_accel_z_sd);
+
+      // This accelerometer result has now been used.
+      accel_sd_ready = false;
+
+    } else {
+
+      static const char *surface_names[] = {
+        "unknown", "table", "cardboard", "carpet", "tinfoil"
+      };
+
+      report("# surface = %s, IR mean = %.0f (no accelerometer measurement)\n",
+            surface_names[(int)surface],
+            level);
+    }
 
     // Show the detected surface's LED colour.
     if (surface == SURF_TABLE) {
@@ -776,15 +864,16 @@ void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
     } else if (surface == SURF_CARDBOARD) {
       robot.setLED(255, 140, 0, MENU_LED_BRIGHTNESS);       // orange: cardboard
     } else if (surface == SURF_CARPET) {
-      robot.setLED(255, 192, 203, MENU_LED_BRIGHTNESS);     // pink: carpet
+      robot.setLED(255, 192, 203, MENU_LED_BRIGHTNESS);     // red: carpet
     } else {
       robot.setLED(0, 255, 0, MENU_LED_BRIGHTNESS);         // green: tinfoil
     }
 
-    static const char *surface_names[] = {"unknown","table","cardboard","carpet","tinfoil"};
-
-    report("# surface = %s, mean IR = %.0f\n",
-          surface_names[(int)surface], level);
+    rest_ir_sum = 0;
+    rest_ir_count = 0;
+    surface_action_done = false;
+    candidate_surface = SURF_UNKNOWN;
+    candidate_surface_count = 0;
 
     stall_window_ms = now;
     stall_left_start = robot.getLeftEncoderCount();
@@ -828,9 +917,65 @@ void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
     surface_action_done = true;
   }
 
-  // Detect a transition while driving. Require several consecutive readings
-  // so one noisy sample cannot trigger a stop and reclassification.
-  if (reading_surface != surface) {
+  // Detect a transition while driving. Require several consecutive IR
+  // readings before starting a fresh accelerometer measurement.
+  if (awaiting_transition_accel) {
+
+    // If the reading has returned to the previous surface, cancel the
+    // transition attempt.
+    if (reading_surface == surface) {
+
+      awaiting_transition_accel = false;
+      candidate_surface = SURF_UNKNOWN;
+      candidate_surface_count = 0;
+      accel_z_count = 0;
+      accel_sd_ready = false;
+
+    } else {
+
+      // If another surface is detected, restart the measurement window.
+      if (reading_surface != candidate_surface) {
+
+        candidate_surface = reading_surface;
+        candidate_surface_count = 1;
+
+        accel_z_count = 0;
+        accel_sd_ready = false;
+
+      } else if (candidate_surface_count < SURFACE_CHANGE_SAMPLES) {
+
+        candidate_surface_count++;
+      }
+
+      // Only stop once we have both a fresh accelerometer measurement
+      // and a stable IR reading for the new surface.
+      if (accel_sd_ready &&
+          candidate_surface_count >= SURFACE_CHANGE_SAMPLES) {
+
+        robot.setMotorPWM(0, 0);
+
+        // Move into the stationary measurement stage.
+        surface = SURF_UNKNOWN;
+
+        awaiting_transition_accel = false;
+
+        rest_ir_sum = 0;
+        rest_ir_count = 0;
+
+        candidate_surface = SURF_UNKNOWN;
+        candidate_surface_count = 0;
+
+        // IMPORTANT:
+        // Do not clear accel_sd_ready here.
+        // The fresh measurement must be preserved for the combined
+        // stationary classification above.
+
+        return;
+      }
+    }
+
+  } else if (reading_surface != surface) {
+
     if (candidate_surface == reading_surface) {
       candidate_surface_count++;
     } else {
@@ -839,15 +984,21 @@ void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
     }
 
     if (candidate_surface_count >= SURFACE_CHANGE_SAMPLES) {
-      robot.setMotorPWM(0, 0);
-      surface = SURF_UNKNOWN;
-      rest_ir_sum = 0;
-      rest_ir_count = 0;
-      candidate_surface = SURF_UNKNOWN;
+
+      // A possible new surface has been detected.
+      // Keep driving briefly to collect accelerometer data on it.
+      awaiting_transition_accel = true;
+
+      // Discard measurements from the previous surface.
+      accel_z_count = 0;
+      accel_sd_ready = false;
+
+      // Keep the candidate surface so we can check that IR remains stable.
       candidate_surface_count = 0;
-      return;
     }
+
   } else {
+
     candidate_surface = SURF_UNKNOWN;
     candidate_surface_count = 0;
   }
