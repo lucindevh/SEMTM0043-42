@@ -794,48 +794,13 @@ void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
         accel_surface = SURF_CARPET;
       }
 
-      // Convert both classifications to an ordered scale:
-      // table = 0, cardboard = 1, tinfoil = 2, carpet = 3.
-      int ir_rank;
-      int accel_rank;
-
-      switch (ir_surface) {
-        case SURF_TABLE:     ir_rank = 0; break;
-        case SURF_CARDBOARD: ir_rank = 1; break;
-        case SURF_TINFOIL:   ir_rank = 2; break;
-        case SURF_CARPET:    ir_rank = 3; break;
-        default:             ir_rank = 0; break;
+      // Use the IR classification when the sensors disagree.
+      // Only accept the accelerometer classification when it agrees with IR.
+      if (ir_surface == accel_surface) {
+        surface = accel_surface;
+      } else {
+        surface = ir_surface;
       }
-
-      switch (accel_surface) {
-        case SURF_TABLE:     accel_rank = 0; break;
-        case SURF_CARDBOARD: accel_rank = 1; break;
-        case SURF_TINFOIL:   accel_rank = 2; break;
-        case SURF_CARPET:    accel_rank = 3; break;
-        default:             accel_rank = 0; break;
-      }
-
-      // Combine the two sensor classifications equally.
-      // If their average falls halfway between two classes, round towards
-      // the accelerometer classification.
-      int rank_sum = ir_rank + accel_rank;
-      int fused_rank = rank_sum / 2;
-
-      if ((rank_sum % 2 != 0) && (accel_rank > ir_rank)) {
-        fused_rank++;
-      }
-
-      switch (fused_rank) {
-        case 0: surface = SURF_TABLE; break;
-        case 1: surface = SURF_CARDBOARD; break;
-        case 2: surface = SURF_TINFOIL; break;
-        case 3: surface = SURF_CARPET; break;
-        default: surface = ir_surface; break;
-      }
-
-      static const char *surface_names[] = {
-        "unknown", "table", "cardboard", "carpet", "tinfoil"
-      };
 
       report("# surface = %s, IR = %s, accel = %s, IR mean = %.0f, accel SD = %.1f\n",
             surface_names[(int)surface],
