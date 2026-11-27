@@ -1,0 +1,1077 @@
+#include "Controller.h"
+
+const unsigned long Controller_c::UPDATE_INTERVAL_MS;
+const unsigned long Controller_c::TELEMETRY_INTERVAL_MS;
+const unsigned long Controller_c::RECOVERY_TIMEOUT_MS;
+const uint16_t Controller_c::LINE_THRESHOLD;
+constexpr float Controller_c::BASE_PWM;
+constexpr float Controller_c::LINE_FOLLOW_GAIN;
+constexpr float Controller_c::RECOVERY_LEFT_PWM;
+constexpr float Controller_c::RECOVERY_RIGHT_PWM;
+const unsigned long Controller_c::MENU_INTERVAL_MS;
+const unsigned int Controller_c::MOTOR_TEST_CALLS;
+constexpr float Controller_c::MOTOR_TEST_MAX_PWM;
+const uint8_t Controller_c::MENU_LED_BRIGHTNESS;
+const unsigned long Controller_c::ENCODER_TEST_T1_MS;
+const unsigned long Controller_c::ENCODER_TEST_WINDOW_MS;
+const unsigned long Controller_c::ENCODER_TEST_TIMEOUT_MS;
+constexpr float Controller_c::ENCODER_TEST_LEFT_PWM;
+constexpr float Controller_c::ENCODER_TEST_RIGHT_PWM;
+const unsigned int Controller_c::REST_SAMPLES;
+constexpr float Controller_c::IR_TINFOIL_MAX;
+constexpr float Controller_c::IR_CARPET_MIN;
+constexpr float Controller_c::IR_CARPET_MAX;
+constexpr float Controller_c::IR_CARDBOARD_MAX;
+const unsigned long Controller_c::STALL_WINDOW_MS;
+const int32_t Controller_c::STALL_TICKS;
+constexpr float Controller_c::KICK_STEP;
+constexpr float Controller_c::MAX_KICK;
+
+// Scripted sequence for the combined (red) test.
+static const unsigned long COMBINED_STILL_START_MS = 1500;    // stationary at the start
+static const float         COMBINED_FORWARD_MM     = 200.0f;  // forward move
+static const float         COMBINED_LEFT_RAD       = PI / 2.0f;   // +90 degrees (left)
+static const float         COMBINED_RIGHT_RAD      = -PI;         // -180 degrees (right)
+static const unsigned long COMBINED_STILL_END_MS   = 5000;   // stationary at the end
+
+// ---------------------------------------------------------------------------
+// Construction / reset
+// ---------------------------------------------------------------------------
+
+Controller_c::Controller_c()
+  : update_timer(UPDATE_INTERVAL_MS),
+    telemetry_timer(TELEMETRY_INTERVAL_MS),
+    selected_routine(ROUTINE_SURFACE_CLASSIFY),
+    menu_timer(MENU_INTERVAL_MS),
+    menu_started(false) {
+  reset();         // also clears the gyro bias state (see reset())
+  trial_num = 0;   // only set here: reset() must not wipe it between trials
+  odometry.setLeftWheelRadiusMm(16.35);
+  odometry.setRightWheelRadiusMm(16.35);
+  odometry.setWheelSeparationMm(87.0);
+}
+
+void Controller_c::reset() {
+  signal = 0;
+  mode = WAITING;
+  recovery_start_ms = 0;
+  call_count = 0;
+  active_routine = ROUTINE_SURFACE_CLASSIFY;
+  led_dirty = true;   // redraw the menu LED next time the menu runs
+  encoders_fresh = false;
+  et_phase = ET_START;
+  et_start_ms = 0;
+  et_t1_ms = 0;
+  et_t2_ms = 0;
+  et_left_count1 = 0;
+  et_left_count2 = 0;
+  et_right_count1 = 0;
+  et_right_count2 = 0;
+  last_surface_us = 0;
+  sample_num = 0;
+
+  // Surface classification: forget the last surface so the next run measures again.
+  surface = SURF_UNKNOWN;
+  rest_ir_sum = 0;
+  rest_ir_count = 0;
+  pwm_kick = 0;
+  stall_window_ms = 0;
+
+  // Maze state
+  maze_started = false;
+  maze_finished = false;
+  surface_action_done = false;
+
+  maze_turn_started = false;
+  maze_turn_seen_running = false;
+  maze_turn_start_ms = 0;
+
+  candidate_surface = SURF_UNKNOWN;
+  candidate_surface_count = 0;
+
+  // Gyro bias: forget it, so the next routine run measures a fresh bias
+  // (the bias changes between power-ups and with temperature).
+  bias_ready = false;
+  bias_count = 0;
+  for (int i = 0; i < 3; i++) {
+    gyro_bias_sum[i] = 0;
+    gyro_bias_dps[i] = 0;
+  }
+
+  // selected_routine and menu_timer are intentionally left alone.
+  // trial_num is NOT reset here: it counts trials across button presses.
+}
+
+// ---------------------------------------------------------------------------
+// Signal handling
+// ---------------------------------------------------------------------------
+
+uint8_t Controller_c::getSignal() const {
+  return signal;
+}
+
+void Controller_c::setSignal(uint8_t requested_signal) {
+  if (requested_signal == 0) {
+    reset();
+    return;
+  }
+
+  if (signal == 0) {
+    signal = 1;
+    mode = FOLLOWING_LINE;
+    recovery_start_ms = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main update loop
+// ---------------------------------------------------------------------------
+
+void Controller_c::update(Robot_c &robot, RobotWifiAP_c &server, RobotIMU_c &imu) {
+
+  // report() sends through this server, so keep the pointer current.
+  wifi = &server;
+
+  // Get the current count of milliseconds since the StampC3 was powered on.
+  unsigned long now = robot.getMillis();
+
+  // Gate everything on the 10 ms update timer.
+  if (!update_timer.isReady(now)) {
+    return;
+  }
+  update_timer.resetTimer(now);
+
+  bool encoder_test_running = (signal == 1 && active_routine == ROUTINE_ENCODER_TEST);
+
+  // Routines that print CSV rows (to Serial and WiFi): telemetry is paused for
+  // them so it cannot corrupt the CSV.
+  bool csv_logging_running = (signal == 1 &&
+                              (active_routine == ROUTINE_ODOMETRY_TEST ||
+                               active_routine == ROUTINE_SENSOR_TEST ||
+                               active_routine == ROUTINE_COMBINED_TEST));
+
+  // Ask the robot for latest information on surface reflectance sensors.
+  if (!encoder_test_running) {
+    robot.getSurfaceSensors();
+  }
+
+  // Latest encoder information, then update the local odometry.
+  encoders_fresh = robot.getEncoders();
+  if (encoders_fresh) {
+    odometry.update(robot.getLeftEncoderCount(), robot.getRightEncoderCount());
+
+    // Odometry test: one CSV row per fresh encoder update.
+    if (signal == 1 && active_routine == ROUTINE_ODOMETRY_TEST) {
+      if (rotation_test) {
+        reportOdometryRotation(robot, now);
+      } else {
+        reportOdometryTranslation(robot, now);
+      }
+    }
+  }
+
+  // Pose estimation from the Pololu 3Pi robot itself.
+  if (!encoder_test_running) {
+    robot.getPose();
+  }
+
+  // While waiting, the LED menu steps between routines. A button press starts
+  // the routine the LED is showing. isButtonPressed() consumes the press when
+  // it returns true, so it is called in exactly one place per routine.
+  if (signal == 0) {
+    updateMenu(robot, now);
+    if (robot.isButtonPressed()) {
+      active_routine = selected_routine;
+      call_count = 0;
+      et_phase = ET_START;
+      setSignal(1);
+
+      // Combined test set-up: zero the local pose and print the header once.
+      // (The gyro bias was cleared by reset() when the last run ended, so it
+      // is measured again from the first samples of this run.)
+      if (active_routine == ROUTINE_COMBINED_TEST) {
+        odometry.reset();
+        press_ms = now;          // start of the stationary period
+        move_started = false;
+        move_running = false;
+        report("test_name,trial_num,condition,controller_ms,imu_timestamp_us,sequence,gyro_x_raw,gyro_y_raw,gyro_z_raw,yaw_rate_dps,left_encoder_count,right_encoder_count,odometry_heading_rad,encoders_fresh,odometry_x_mm,odometry_y_mm,accel_x_raw,accel_y_raw,accel_z_raw,surface_dn1,surface_dn2,surface_dn3,surface_dn4,surface_dn5\n");
+      }
+
+      // Odometry test needs its own set-up when it starts.
+      if (active_routine == ROUTINE_ODOMETRY_TEST) {
+        odometry.reset();
+        move_attempted = false;
+        move_started = false;
+        move_running = false;
+        move_finished = false;
+        press_ms = now;
+        if (rotation_test) {
+          report("test_name,trial_num,commanded_angle_rad,sample_time_ms,left_encoder_count,right_encoder_count,odometry_x_mm,odometry_y_mm,odometry_theta_rad\n");
+        } else {
+          report("test_name,trial_num,commanded_distance_mm,sample_time_ms,left_encoder_count,right_encoder_count,odometry_x_mm,odometry_y_mm,odometry_theta_rad\n");
+        }
+      }
+    }
+  }
+
+  // A routine has been started, so run the one that was selected.
+  if (signal == 1) {
+    if (active_routine == ROUTINE_MOTOR_TEST) {
+      motorTest(robot, now);
+    } else if (active_routine == ROUTINE_ENCODER_TEST) {
+      encoderTest(robot, now);
+    } else if (active_routine == ROUTINE_ODOMETRY_TEST) {
+      odometryTest(robot, now);
+    } else if (active_routine == ROUTINE_SENSOR_TEST) {
+      // ---- Choose ONE sensor test function to run below ----
+      testOffset(robot, now);       // Exercise 2
+      // sensorTest(robot, now);    // Exercise 1
+
+      // The sensor test runs until the button is pressed again.
+      if (robot.isButtonPressed()) {
+        robot.setMotorPWM(0, 0);
+        menu_timer.resetTimer(now);
+        setSignal(0);               // soft reset: back to the menu
+      }
+    } else if (active_routine == ROUTINE_COMBINED_TEST) {
+      // ---- Scripted sequence. call_count is the phase: ----
+      //   0 stationary at the start (also measures the gyro bias)
+      //   1 forward 200 mm, 2 rotate 90 deg left, 3 rotate 180 deg right
+      //   4 stationary at the end, then back to the menu
+      // Motors are NOT zeroed every cycle here: that would cancel a move in progress.
+      if (call_count == 0) {
+        robot.setMotorPWM(0, 0);
+        // Wait for the full stationary time AND a finished bias measurement.
+        if (bias_ready && now - press_ms >= COMBINED_STILL_START_MS) {
+          call_count = 1;
+          move_started = false;
+          move_running = false;
+        }
+
+      } else if (call_count >= 1 && call_count <= 3) {
+        if (!move_started) {
+          // Start this phase's move once.
+          bool ok;
+          if (call_count == 1) {
+            ok = robot.startMoveDistance(COMBINED_FORWARD_MM);
+          } else if (call_count == 2) {
+            ok = robot.startRotateAngle(COMBINED_LEFT_RAD);
+          } else {
+            ok = robot.startRotateAngle(COMBINED_RIGHT_RAD);
+          }
+          if (ok) {
+            move_started = true;
+            move_running = false;
+            move_start_ms = now;
+          } else {
+            report("# start of move failed\n");
+            robot.setMotorPWM(0, 0);
+            call_count = 4;               // skip the rest, go to the end hold
+            move_start_ms = now;
+          }
+        } else {
+          // Poll the helper until it finishes, fails or times out.
+          bool stop_now = false;
+          bool abort_run = false;
+
+          if (robot.getMotionStatus()) {
+            if (robot.isMotionHelperRunning()) {
+              move_running = true;
+            } else if (move_running) {
+              stop_now = true;            // it ran and has now stopped
+            }
+          } else {
+            report("# getMotionStatus failed\n");
+            abort_run = true;
+          }
+
+          if (!stop_now && !abort_run && now - move_start_ms > move_timeout_ms) {
+            report("# move timed out\n");
+            abort_run = true;
+          }
+
+          if (stop_now || abort_run) {
+            robot.setMotorPWM(0, 0);      // explicit stop; also cancels the helper
+            move_started = false;
+            move_running = false;
+            move_start_ms = now;          // becomes the start of the end hold if this was the last phase
+            if (abort_run) {
+              call_count = 4;
+            } else {
+              call_count = call_count + 1;
+            }
+          }
+        }
+
+      } else if (call_count == 4) {
+        robot.setMotorPWM(0, 0);
+        if (now - move_start_ms >= COMBINED_STILL_END_MS) {
+          trial_num++;
+          menu_timer.resetTimer(now);
+          setSignal(0);                   // run finished: back to the menu
+        }
+      }
+
+      // Acquire only when a sample is ready AND the read succeeds.
+      if (imu.isSampleReady() && imu.read()) {
+        const auto s = imu.getSample();   // copy the sample
+
+        // 1. Calibrate: average the first BIAS_SAMPLES readings (robot must be still).
+        if (!bias_ready) {
+          for (int i = 0; i < 3; i++) {
+            gyro_bias_sum[i] += RobotIMU_c::gyroscopeToDegreesPerSecond(s.gyroscope[i]);
+          }
+          bias_count++;
+          if (bias_count >= BIAS_SAMPLES) {
+            for (int i = 0; i < 3; i++) {
+              gyro_bias_dps[i] = gyro_bias_sum[i] / bias_count;
+            }
+            bias_ready = true;
+          }
+        }
+
+        // 2. Apply it: yaw rate in deg/s with the stationary offset removed.
+        //    Stays NaN until the bias has been measured.
+        float yaw_rate = NAN;
+        if (bias_ready && yaw_axis >= 0 && yaw_axis <= 2) {
+          yaw_rate = yaw_sign * (RobotIMU_c::gyroscopeToDegreesPerSecond(s.gyroscope[yaw_axis])
+                                 - gyro_bias_dps[yaw_axis]);
+        }
+
+        reportCombined(robot, s, yaw_rate, now);
+      }
+
+      // The only button read in this routine: press to go back to the menu.
+      if (robot.isButtonPressed()) {
+        robot.setMotorPWM(0, 0);
+        menu_timer.resetTimer(now);
+        setSignal(0);               // soft reset: back to the menu
+      }
+    } else {
+      // White: surface classification. Measures the surface while stationary,
+      // shows the surface's LED colour, then drives with a surface-specific PWM.
+      // Runs only on fresh encoder reads so the stall check never uses stale counts.
+      if (encoders_fresh) {
+        surfaceClassify(robot, now);
+      }
+      if (robot.isButtonPressed()) {
+        robot.setMotorPWM(0, 0);    // the motors may be running now, so stop them
+        menu_timer.resetTimer(now);
+        setSignal(0);
+      }
+    }
+  }
+
+  // Telemetry (paused during the CSV-logging tests, and currently commented out).
+  if (!encoder_test_running && !csv_logging_running && telemetry_timer.isReady(now)) {
+    telemetry_timer.resetTimer(now);
+    //publishTelemetry(robot, server, now);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LED menu
+// ---------------------------------------------------------------------------
+
+void Controller_c::updateMenu(Robot_c &robot, unsigned long now) {
+  if (!menu_started) {
+    menu_started = true;
+    menu_timer.resetTimer(now);
+  }
+
+  if (menu_timer.isReady(now)) {
+    menu_timer.resetTimer(now);
+    if (selected_routine == ROUTINE_SURFACE_CLASSIFY) {
+      selected_routine = ROUTINE_COMBINED_TEST;
+    } else {
+      selected_routine = ROUTINE_SURFACE_CLASSIFY;
+    }
+    led_dirty = true;
+  }
+
+  // Only touch the LED when it needs to change: setLED() waits on the RMT
+  // peripheral, so calling it every 10 ms cycle would add needless delay.
+  if (led_dirty) {
+    led_dirty = false;
+    if (selected_routine == ROUTINE_SURFACE_CLASSIFY) {
+      robot.setLED(255, 255, 255, MENU_LED_BRIGHTNESS);   // white
+    } else {
+      robot.setLED(255, 0, 0, MENU_LED_BRIGHTNESS);       // red
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Motor test
+// ---------------------------------------------------------------------------
+
+void Controller_c::motorTest(Robot_c &robot, unsigned long now) {
+  if (call_count >= MOTOR_TEST_CALLS) {
+    // Finished. Send an explicit stop FIRST: reset() sends no motor command.
+    // Only return to the menu once the stop write has succeeded; otherwise
+    // signal stays 1 and the stop is retried on the next cycle.
+    if (robot.setMotorPWM(0, 0)) {
+      menu_timer.resetTimer(now);   // show the menu colour for a full interval
+      setSignal(0);                 // soft reset: back to the menu
+    }
+    return;
+  }
+
+  // Ramp 0 -> MOTOR_TEST_MAX_PWM across calls 0 .. MOTOR_TEST_CALLS-1.
+  float pwm = MOTOR_TEST_MAX_PWM * (float)call_count / (float)(MOTOR_TEST_CALLS - 1);
+  call_count = call_count + 1;
+
+  // Opposite signs: the left wheel is driven negative, the right positive.
+  // Which way each wheel visibly turns is a convention: check with the encoders.
+  robot.setMotorPWM(-pwm, pwm);
+}
+
+// ---------------------------------------------------------------------------
+// Encoder test
+// ---------------------------------------------------------------------------
+
+void Controller_c::encoderTest(Robot_c &robot, unsigned long now) {
+  // Safety limit: if the test overruns (for example because encoder reads keep
+  // failing), stop the motor rather than leaving it running.
+  if ((et_phase == ET_WAIT_T1 || et_phase == ET_WAIT_T2) &&
+      now - et_start_ms >= ENCODER_TEST_TIMEOUT_MS) {
+    report("ENC TIMEOUT after %lu ms: no result, stopping motor\n", now - et_start_ms);
+    et_phase = ET_STOP;
+  }
+
+  if (et_phase == ET_START) {
+    // Both motors. setMotorPWM(left, right). Timing starts only once the
+    // command has been accepted.
+    if (robot.setMotorPWM(ENCODER_TEST_LEFT_PWM, ENCODER_TEST_RIGHT_PWM)) {
+      et_start_ms = now;
+      et_phase = ET_WAIT_T1;
+      report("ENC start: left PWM %.0f, right PWM %.0f\n",
+             ENCODER_TEST_LEFT_PWM, ENCODER_TEST_RIGHT_PWM);
+    }
+    return;
+  }
+
+  if (et_phase == ET_WAIT_T1) {
+    // First FRESH snapshot at or after t1. A failed read is skipped, so the
+    // stale cached counts are never used. Both wheels come from this one
+    // snapshot, so they share the same t1.
+    if (encoders_fresh && now - et_start_ms >= ENCODER_TEST_T1_MS) {
+      et_t1_ms = now;
+      et_left_count1 = robot.getLeftEncoderCount();
+      et_right_count1 = robot.getRightEncoderCount();
+      et_phase = ET_WAIT_T2;
+      report("ENC t1 = %lu ms, left count = %ld, right count = %ld\n",
+             et_t1_ms - et_start_ms, (long)et_left_count1, (long)et_right_count1);
+    }
+    return;
+  }
+
+  if (et_phase == ET_WAIT_T2) {
+    if (encoders_fresh && now - et_t1_ms >= ENCODER_TEST_WINDOW_MS) {
+      et_t2_ms = now;
+      et_left_count2 = robot.getLeftEncoderCount();
+      et_right_count2 = robot.getRightEncoderCount();
+      unsigned long elapsed_ms = et_t2_ms - et_t1_ms;
+
+      report("ENC t2 = %lu ms, left count = %ld, right count = %ld\n",
+             et_t2_ms - et_start_ms, (long)et_left_count2, (long)et_right_count2);
+      if (elapsed_ms == 0) {
+        report("ENC invalid: zero elapsed time, no speed calculated\n");
+      } else {
+        printWheelSpeed("left", et_left_count1, et_left_count2,
+                        elapsed_ms, odometry.leftWheelRadiusMm);
+        printWheelSpeed("right", et_right_count1, et_right_count2,
+                        elapsed_ms, odometry.rightWheelRadiusMm);
+      }
+      et_phase = ET_STOP;
+    }
+    return;
+  }
+
+  if (et_phase == ET_STOP) {
+    // Explicit stop FIRST (reset() sends no motor command). Waiting for the
+    // button only starts once the stop write succeeds; otherwise the stop is
+    // retried next cycle.
+    if (robot.setMotorPWM(0, 0)) {
+      et_phase = ET_WAIT_BUTTON;
+      report("ENC motor stopped. Press the button to return to the menu\n");
+    }
+    return;
+  }
+
+  if (et_phase == ET_WAIT_BUTTON) {
+    // The motor is already stopped. Telemetry stays paused (signal is still 1 and
+    // the encoder test is still active), so the lines above stay on screen. This is
+    // the only place the button is read while this routine runs, because
+    // isButtonPressed() consumes the press when it returns true.
+    if (robot.isButtonPressed()) {
+      report("ENC button pressed, normal readings resume\n");
+      menu_timer.resetTimer(now);   // show the menu colour for a full interval
+      setSignal(0);                 // soft reset: back to the menu
+    }
+  }
+}
+
+void Controller_c::printWheelSpeed(const char *label, int32_t count1, int32_t count2,
+                                   unsigned long elapsed_ms, float radius_mm) {
+  // Current minus previous, forward positive (OdometryModel.h). The
+  // subtraction is done on unsigned values so a counter wrap is harmless.
+  int32_t delta = (int32_t)((uint32_t)count2 - (uint32_t)count1);
+
+  // counts/s = delta / (elapsed in seconds); milliseconds converted explicitly.
+  float counts_per_s = (float)delta * 1000.0f / (float)elapsed_ms;
+
+  // mm/s = revolutions/s * wheel circumference. The radius and counts per
+  // revolution are the NOMINAL values in odometry, not calibrated ones.
+  float mm_per_s = counts_per_s / odometry.encoderCountsPerRevolution
+                   * TWO_PI * radius_mm;
+
+  report("ENC %s: delta = %ld counts over %lu ms -> %.1f counts/s = %.1f mm/s\n",
+         label, (long)delta, elapsed_ms, counts_per_s, mm_per_s);
+}
+
+// ---------------------------------------------------------------------------
+// Odometry test (move a commanded distance or angle, log CSV rows)
+// The per-row logging happens in update(); this runs the move itself.
+// ---------------------------------------------------------------------------
+
+void Controller_c::odometryTest(Robot_c &robot, unsigned long now) {
+
+  // 1. Start the move once, after a stationary period of logging.
+  if (!move_attempted && now - press_ms >= still_ms) {
+    move_attempted = true;                      // set first, so it can never retry
+    bool started = rotation_test
+                     ? robot.startRotateAngle(commanded_angle_rad)
+                     : robot.startMoveDistance(commanded_distance_mm);
+    if (started) {
+      move_started = true;
+      move_start_ms = now;
+    } else {
+      report("# start of move failed\n");
+      robot.setMotorPWM(0, 0);
+      move_finished = true;
+      finish_ms = now;
+    }
+  }
+
+  // 2. Poll the helper's status until it finishes, fails or times out.
+  if (move_started && !move_finished) {
+    bool stop_now = false;
+
+    if (robot.getMotionStatus()) {
+      if (robot.isMotionHelperRunning()) {
+        move_running = true;
+      } else if (move_running) {
+        stop_now = true;                        // it ran and has now stopped
+      }
+    } else {
+      report("# getMotionStatus failed\n");
+      stop_now = true;                          // abort and diagnose
+    }
+
+    if (!stop_now && now - move_start_ms > move_timeout_ms) {
+      report("# move timed out\n");
+      stop_now = true;
+    }
+
+    if (stop_now) {
+      robot.setMotorPWM(0, 0);                  // explicit stop; also cancels the helper
+      move_finished = true;
+      finish_ms = now;
+    }
+  }
+
+  // 3. Keep logging stationary rows after the move, then end the trial.
+  if (move_finished && now - finish_ms >= still_ms) {
+    trial_num++;
+    menu_timer.resetTimer(now);                 // show the menu colour for a full interval
+    setSignal(0);                               // back to the menu, ready for the next press
+  }
+}
+
+void Controller_c::reportOdometryTranslation(Robot_c &robot, unsigned long timestamp_ms) {
+  report(
+    "%s,%lu,%.1f,%lu,%ld,%ld,%.2f,%.2f,%.5f\n",
+    test_name,
+    (unsigned long)trial_num,
+    commanded_distance_mm,
+    timestamp_ms,
+    (long)robot.getLeftEncoderCount(),
+    (long)robot.getRightEncoderCount(),
+    odometry.pose.x,
+    odometry.pose.y,
+    odometry.pose.theta
+  );
+}
+
+void Controller_c::reportOdometryRotation(Robot_c &robot, unsigned long timestamp_ms) {
+  report(
+    "%s,%lu,%.5f,%lu,%ld,%ld,%.2f,%.2f,%.5f\n",
+    test_name,
+    (unsigned long)trial_num,
+    commanded_angle_rad,
+    timestamp_ms,
+    (long)robot.getLeftEncoderCount(),
+    (long)robot.getRightEncoderCount(),
+    odometry.pose.x,
+    odometry.pose.y,
+    odometry.pose.theta
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Line following
+// ---------------------------------------------------------------------------
+
+bool Controller_c::lineDetected(const Robot_c &robot) const {
+  // Note: only using the central sensor to detect a line.
+  if (robot.surface.reading[2] >= LINE_THRESHOLD) {
+    return true;
+  }
+
+  return false;
+}
+
+void Controller_c::runLineFollower(Robot_c &robot, unsigned long now) {
+  bool line_detected = lineDetected(robot);
+
+  if (!line_detected && mode == FOLLOWING_LINE) {
+    mode = SEARCHING_FOR_LINE;
+    recovery_start_ms = now;
+  }
+
+  if (mode == SEARCHING_FOR_LINE) {
+    if (line_detected) {
+      mode = FOLLOWING_LINE;
+    } else if (now - recovery_start_ms >= RECOVERY_TIMEOUT_MS) {
+      mode = STOPPED;
+    }
+  }
+
+  if (mode == STOPPED) {
+    robot.setMotorPWM(0, 0);
+    return;
+  }
+
+  if (mode == SEARCHING_FOR_LINE) {
+    robot.setMotorPWM(RECOVERY_LEFT_PWM, RECOVERY_RIGHT_PWM);
+    return;
+  }
+
+  float error = (float)robot.surface.reading[1] - (float)robot.surface.reading[3];
+  float turn = error * LINE_FOLLOW_GAIN;
+  robot.setMotorPWM(BASE_PWM - turn, BASE_PWM + turn);
+}
+
+// ---------------------------------------------------------------------------
+// Exercise 1: sensorTest - raw 5-value CSV line for Serial Plotter
+// ---------------------------------------------------------------------------
+
+void Controller_c::sensorTest(Robot_c &robot, unsigned long now) {
+  report("%u,%u,%u,%u,%u\n",
+         (unsigned)robot.surface.reading[0],
+         (unsigned)robot.surface.reading[1],
+         (unsigned)robot.surface.reading[2],
+         (unsigned)robot.surface.reading[3],
+         (unsigned)robot.surface.reading[4]);
+
+  robot.setMotorPWM(0, 0);
+
+  // No delay: the 10 ms update timer governs the sampling rate.
+}
+
+// ---------------------------------------------------------------------------
+// Exercise 2: testOffset - labelled per-sensor CSV rows
+// ---------------------------------------------------------------------------
+
+void Controller_c::testOffset(Robot_c &robot, unsigned long now) {
+  // Only process genuinely new snapshots.
+  if (robot.surface.timestamp_us <= last_surface_us) {
+    return;
+  }
+  last_surface_us = robot.surface.timestamp_us;
+
+  // Print one row per sensor with the agreed label scheme:
+  // test_name,trial_num,sample_num,sample_time,sensor_num,sensor_reading
+  for (uint8_t i = 0; i < 5; i++) {
+    report("offsetTest_white,%lu,%lu,%lu,%u,%u\n",
+           (unsigned long)trial_num,
+           (unsigned long)sample_num,
+           (unsigned long)robot.surface.timestamp_us,
+           (unsigned)i,
+           (unsigned)robot.surface.reading[i]);
+  }
+
+  sample_num++;
+  robot.setMotorPWM(0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Surface classification (table / cardboard / carpet / tinfoil)
+// ---------------------------------------------------------------------------
+
+Controller_c::Surface Controller_c::classifyReading(float reading) const {
+  if (reading < IR_TINFOIL_MAX) {
+    return SURF_TINFOIL;            // below 495
+  } else if (reading < IR_CARPET_MIN) {
+    return SURF_CARDBOARD;          // 495 to below 610
+  } else if (reading < IR_CARPET_MAX) {
+    return SURF_CARPET;             // 610 to below 811
+  } else if (reading < IR_CARDBOARD_MAX) {
+    return SURF_CARDBOARD;          // 811 to below 970
+  } else {
+    return SURF_TABLE;              // 970 and above
+  }
+}
+
+void Controller_c::surfaceClassify(Robot_c &robot, unsigned long now) {
+
+  // 1) If the maze has finished, keep the motors stopped.
+  if (maze_finished) {
+    robot.setMotorPWM(0, 0);
+    return;
+  }
+
+  // Use only the centre sensor (DN3), so a reading is never a mix of two
+  // surfaces when the robot is straddling an edge. Matches the digital twin.
+  float ir = (float)robot.surface.reading[2];
+
+
+  // 2) MEASURE: classify a new surface while stationary.
+  if (surface == SURF_UNKNOWN) {
+
+    robot.setMotorPWM(0, 0);
+
+    rest_ir_sum += ir;
+    rest_ir_count++;
+
+    if (rest_ir_count < REST_SAMPLES) {
+      return;
+    }
+
+    float level = rest_ir_sum / (float)rest_ir_count;
+
+    surface = classifyReading(level);
+
+    // Show the surface's LED colour.
+    if (surface == SURF_TABLE) {
+      robot.setLED(0, 0, 255, MENU_LED_BRIGHTNESS);
+    } else if (surface == SURF_CARDBOARD) {
+      robot.setLED(255, 140, 0, MENU_LED_BRIGHTNESS);
+    } else if (surface == SURF_CARPET) {
+      robot.setLED(255, 192, 203, MENU_LED_BRIGHTNESS);
+    } else {
+      robot.setLED(0, 255, 0, MENU_LED_BRIGHTNESS);
+    }
+
+    report("# surface = %d, mean IR = %.0f\n", (int)surface, level);
+
+    // Prepare for the next movement.
+    surface_action_done = false;
+    candidate_surface_count = 0;
+
+    stall_window_ms = now;
+    stall_left_start = robot.getLeftEncoderCount();
+    stall_right_start = robot.getRightEncoderCount();
+
+    return;
+  }
+
+
+  // 3) HANDLE AN ACTIVE TURN.
+  // Keep checking until the rotation helper finishes.
+  if (maze_turn_started) {
+
+    bool stop_now = false;
+
+    if (robot.getMotionStatus()) {
+
+      if (robot.isMotionHelperRunning()) {
+        maze_turn_seen_running = true;
+
+      } else if (maze_turn_seen_running) {
+        stop_now = true;
+      }
+
+    } else {
+      report("# turn status failed\n");
+      stop_now = true;
+      maze_finished = true;
+    }
+
+    // Safety timeout.
+    if (!stop_now && now - maze_turn_start_ms > move_timeout_ms) {
+      report("# turn timed out\n");
+      stop_now = true;
+      maze_finished = true;
+    }
+
+    if (stop_now) {
+      robot.setMotorPWM(0, 0);
+      maze_turn_started = false;
+      maze_turn_seen_running = false;
+    }
+
+    return;
+  }
+
+
+  // 4) CALCULATE FORWARD PWM.
+  float scale = 1.0f;
+
+  if (surface == SURF_CARPET) {
+    scale = 1.4f;
+  } else if (surface == SURF_TINFOIL) {
+    scale = 0.95f;
+  }
+
+
+  // Stuck detection and PWM adjustment.
+  if (now - stall_window_ms >= STALL_WINDOW_MS) {
+
+    int32_t left_count = robot.getLeftEncoderCount();
+    int32_t right_count = robot.getRightEncoderCount();
+
+    int32_t ticks = abs(left_count - stall_left_start)
+                  + abs(right_count - stall_right_start);
+
+    if (ticks < STALL_TICKS) {
+      pwm_kick = pwm_kick + KICK_STEP;
+
+      if (pwm_kick > MAX_KICK) {
+        pwm_kick = MAX_KICK;
+      }
+
+    } else {
+      pwm_kick = pwm_kick - KICK_STEP;
+
+      if (pwm_kick < 0.0f) {
+        pwm_kick = 0.0f;
+      }
+    }
+
+    stall_window_ms = now;
+    stall_left_start = left_count;
+    stall_right_start = right_count;
+  }
+
+  float pwm = BASE_PWM * scale + pwm_kick;
+
+
+  // 5) PER-SURFACE ACTIONS.
+  // Each surface only triggers its action once.
+
+  if (!surface_action_done) {
+
+    if (surface == SURF_TABLE) {
+
+      if (!maze_started) {
+
+        // First table: start the maze.
+        maze_started = true;
+        surface_action_done = true;
+
+        report("# maze started\n");
+
+      } else {
+
+        // Second table: finish the maze.
+        robot.setMotorPWM(0, 0);
+        maze_finished = true;
+
+        report("# maze finished\n");
+        return;
+      }
+
+    } else if (surface == SURF_TINFOIL) {
+
+      // Tinfoil: turn right 90 degrees.
+      if (robot.startRotateAngle(-PI / 2.0f)) {
+
+        maze_turn_started = true;
+        maze_turn_seen_running = false;
+        maze_turn_start_ms = now;
+        surface_action_done = true;
+
+        report("# turning right\n");
+
+      } else {
+        report("# right turn failed\n");
+        robot.setMotorPWM(0, 0);
+        maze_finished = true;
+      }
+
+      return;
+
+    } else if (surface == SURF_CARPET) {
+
+      // Carpet: turn left 90 degrees.
+      if (robot.startRotateAngle(PI / 2.0f)) {
+
+        maze_turn_started = true;
+        maze_turn_seen_running = false;
+        maze_turn_start_ms = now;
+        surface_action_done = true;
+
+        report("# turning left\n");
+
+      } else {
+        report("# left turn failed\n");
+        robot.setMotorPWM(0, 0);
+        maze_finished = true;
+      }
+
+      return;
+
+    } else if (surface == SURF_CARDBOARD) {
+
+      // Cardboard: continue straight.
+      surface_action_done = true;
+      report("# going straight\n");
+    }
+  }
+
+
+  // 6) CHECK WHETHER THE ROBOT HAS ENTERED A DIFFERENT SURFACE.
+  // Classify the live sensor reading to see whether it differs
+  // from the surface currently being traversed.
+
+  Surface observed_surface = classifyReading(ir);
+
+  if (observed_surface != surface) {
+
+    if (observed_surface == candidate_surface) {
+      candidate_surface_count++;
+    } else {
+      candidate_surface = observed_surface;
+      candidate_surface_count = 1;
+    }
+
+    // Require several consecutive readings before accepting a change.
+    if (candidate_surface_count >= SURFACE_CHANGE_SAMPLES) {
+
+      robot.setMotorPWM(0, 0);
+
+      // Prepare to classify the new surface.
+      surface = SURF_UNKNOWN;
+      rest_ir_sum = 0;
+      rest_ir_count = 0;
+
+      candidate_surface = SURF_UNKNOWN;
+      candidate_surface_count = 0;
+
+      pwm_kick = 0;
+
+      return;
+    }
+
+  } else {
+    candidate_surface = SURF_UNKNOWN;
+    candidate_surface_count = 0;
+  }
+
+
+  // 7) CONTINUE STRAIGHT.
+  robot.setMotorPWM(pwm, pwm);
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
+
+void Controller_c::publishTelemetry(Robot_c &robot, RobotWifiAP_c &server, unsigned long timestamp_ms) {
+  // server is kept in the signature for compatibility; report() already uses it.
+  (void)server;
+  report(
+    "%lu,%.2f,%.2f,%.5f,%d,%d,%ld,%ld,%u,%u,%u,%u,%u,%u\n",
+    timestamp_ms,
+    odometry.pose.x,
+    odometry.pose.y,
+    odometry.pose.theta,
+    (int)robot.getLeftMotorPWM(),
+    (int)robot.getRightMotorPWM(),
+    (long)robot.getLeftEncoderCount(),
+    (long)robot.getRightEncoderCount(),
+    (unsigned)robot.surface.reading[0],
+    (unsigned)robot.surface.reading[1],
+    (unsigned)robot.surface.reading[2],
+    (unsigned)robot.surface.reading[3],
+    (unsigned)robot.surface.reading[4],
+    (unsigned)signal
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Output to WiFi and Serial
+// ---------------------------------------------------------------------------
+
+void Controller_c::report(const char *format, ...) {
+  const bool wifi_connected = (wifi != nullptr && wifi->clientConnected());
+  const bool serial_connected = (bool)Serial;
+  if (!wifi_connected && !serial_connected) {
+    return;   // nobody is listening, so skip the formatting work
+  }
+
+  char buffer[REPORT_BUFFER_SIZE];
+  va_list args;
+  va_start(args, format);
+  int len = vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  if (len <= 0) {
+    return;
+  }
+  if ((size_t)len >= sizeof(buffer)) {
+    // Too long: keep what fits and still end the line, so the receiver's
+    // later lines are not joined onto this one.
+    len = sizeof(buffer) - 1;
+    buffer[len - 1] = '\n';
+  }
+
+  // Send the exact bytes once to each destination. sendBuffer() is used rather
+  // than RobotWifiAP_c::printf(), which cuts every message at 255 bytes.
+  if (wifi_connected) {
+    wifi->sendBuffer((const uint8_t *)buffer, (size_t)len);
+  }
+  if (serial_connected) {
+    Serial.write((const uint8_t *)buffer, (size_t)len);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Combined Test
+// ---------------------------------------------------------------------------
+
+void Controller_c::reportCombined(Robot_c &robot, const RobotIMUSample_t &s, float yaw_rate, unsigned long timestamp_ms) {
+  // yaw_rate arrives already bias-corrected from update(); it is NaN while the
+  // bias is still being measured, and prints as "nan" until then.
+  // report() sends the row over WiFi even when no USB cable is connected.
+
+  report(
+    "%s,%lu,%s,%lu,%lu,%lu,%d,%d,%d,%.4f,%ld,%ld,%.5f,%d,%.2f,%.2f,%d,%d,%d,%u,%u,%u,%u,%u\n",
+    test_name,
+    (unsigned long)trial_num,
+    condition,
+    timestamp_ms,
+    (unsigned long)s.timestamp_us,
+    (unsigned long)s.sequence,
+    (int)s.gyroscope[0],
+    (int)s.gyroscope[1],
+    (int)s.gyroscope[2],
+    yaw_rate,
+    (long)robot.getLeftEncoderCount(),
+    (long)robot.getRightEncoderCount(),
+    odometry.pose.theta,
+    encoders_fresh ? 1 : 0,
+    odometry.pose.x,
+    odometry.pose.y,
+    (int)s.acceleration[0],
+    (int)s.acceleration[1],
+    (int)s.acceleration[2],
+    (unsigned)robot.surface.reading[0],
+    (unsigned)robot.surface.reading[1],
+    (unsigned)robot.surface.reading[2],
+    (unsigned)robot.surface.reading[3],
+    (unsigned)robot.surface.reading[4]
+  );
+}
